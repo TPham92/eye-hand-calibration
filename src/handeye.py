@@ -167,7 +167,7 @@ class HandEyeCharucoGUI:
         self.captured_pixel_positions = {}  # cid -> (px, py) in captured frame
 
         # Status text for the UI above the dropdown
-        self.board_status_var = tk.StringVar(value="Board status: Not captured")
+        self.board_status_var = tk.StringVar(value="✗ Board not captured")
 
         # Samples (camera corner vs robot base point)
         self.samples = []
@@ -209,7 +209,35 @@ class HandEyeCharucoGUI:
         main.columnconfigure(1, weight=2)
         main.rowconfigure(0, weight=1)
 
-        # ---------- Top row: Robot input (left) and Camera control (right) ----------
+        # ---------- ChArUco board section ----------
+        charuco_frame = ttk.LabelFrame(ctrl, text="ChArUco board")
+        charuco_frame.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(
+            charuco_frame,
+            text=(
+                "Make sure the ChArUco board is fully visible in the color image, "
+                "then click \"Capture board\" to freeze its pose for calibration."
+            ),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=4, pady=(4, 2))
+
+        # Board status label
+        self.board_status_label = tk.Label(
+            charuco_frame,
+            textvariable=self.board_status_var,
+            fg="red",
+            anchor="w",
+        )
+        self.board_status_label.grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 2))
+
+        # Button to capture / recapture the board pose
+        ttk.Button(
+            charuco_frame,
+            text="Capture board",
+            command=self.on_capture_board
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 6))
+
+        # Robot input (left) and Camera control (right)
         top_frame = ttk.Frame(ctrl)
         top_frame.pack(fill=tk.X, pady=(0, 8))
         top_frame.columnconfigure(0, weight=1)
@@ -219,48 +247,35 @@ class HandEyeCharucoGUI:
         input_frame = ttk.LabelFrame(top_frame, text="Robot input (base frame, mm)")
         input_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
 
-        # Board status label
-        ttk.Label(
-            input_frame,
-            textvariable=self.board_status_var
-        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 2))
-
-        # Button to capture / recapture the board pose
-        ttk.Button(
-            input_frame,
-            text="Capture Board",
-            command=self.on_capture_board
-        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 6))
-
-        # Corner dropdown (starts disabled until board is captured)
-        ttk.Label(input_frame, text="ChArUco Corner:").grid(row=2, column=0, sticky="e")
+        # Corner dropdown
+        ttk.Label(input_frame, text="ChArUco Corner:").grid(row=0, column=0, sticky="e")
 
         self.corner_id_var = tk.StringVar()
         self.corner_id_combo = ttk.Combobox(
             input_frame,
             textvariable=self.corner_id_var,
-            state="disabled",   # <--- disabled until Capture Board
+            state="disabled",   # stays disabled until board is captured
             width=10
         )
-        self.corner_id_combo.grid(row=2, column=1, sticky="w", padx=4, pady=2)
+        self.corner_id_combo.grid(row=0, column=1, sticky="w", padx=4, pady=2)
         self.corner_id_combo["values"] = []
         self.corner_id_combo.bind("<<ComboboxSelected>>", self.on_corner_selected)
 
         # Robot coordinates
-        ttk.Label(input_frame, text="Robot X (mm):").grid(row=3, column=0, sticky="e")
+        ttk.Label(input_frame, text="Robot X (mm):").grid(row=1, column=0, sticky="e")
         self.robot_x_entry = ttk.Entry(input_frame, width=10)
-        self.robot_x_entry.grid(row=3, column=1, sticky="w", padx=4, pady=2)
+        self.robot_x_entry.grid(row=1, column=1, sticky="w", padx=4, pady=2)
 
-        ttk.Label(input_frame, text="Robot Y (mm):").grid(row=4, column=0, sticky="e")
+        ttk.Label(input_frame, text="Robot Y (mm):").grid(row=2, column=0, sticky="e")
         self.robot_y_entry = ttk.Entry(input_frame, width=10)
-        self.robot_y_entry.grid(row=4, column=1, sticky="w", padx=4, pady=2)
+        self.robot_y_entry.grid(row=2, column=1, sticky="w", padx=4, pady=2)
 
-        ttk.Label(input_frame, text="Robot Z (mm):").grid(row=5, column=0, sticky="e")
+        ttk.Label(input_frame, text="Robot Z (mm):").grid(row=3, column=0, sticky="e")
         self.robot_z_entry = ttk.Entry(input_frame, width=10)
-        self.robot_z_entry.grid(row=5, column=1, sticky="w", padx=4, pady=2)
+        self.robot_z_entry.grid(row=3, column=1, sticky="w", padx=4, pady=2)
 
         ttk.Button(input_frame, text="Capture Sample", command=self.on_capture_sample) \
-            .grid(row=6, column=0, columnspan=2, pady=4)
+            .grid(row=4, column=0, columnspan=2, pady=4)
 
         # --- Camera control frame ---
         camera_frame = ttk.LabelFrame(top_frame, text="Camera control")
@@ -365,8 +380,6 @@ class HandEyeCharucoGUI:
     def on_capture_board(self):
         """
         Capture (or recapture) the current ChArUco board pose.
-        After this, dropdown + red box use the captured board instead of live detection,
-        so the selection won't jump when the robot arm covers the marker.
         """
         if not self.current_corner_poses or not self.charuco_pixel_positions:
             messagebox.showerror(
@@ -383,15 +396,17 @@ class HandEyeCharucoGUI:
 
         # Update status text
         self.board_status_var.set(
-            f"Board status: Captured ({len(self.captured_corner_ids)} corners)"
+            f"✓ Board captured ({len(self.captured_corner_ids)} corners)"
         )
+        if hasattr(self, "board_status_label"):
+            self.board_status_label.configure(fg="green")
 
         # Enable and update dropdown values to the captured corners
         display_values = [f"C{cid}" for cid in self.captured_corner_ids]
         self.corner_id_combo["values"] = display_values
         self.corner_id_combo.configure(state="readonly")
 
-        # Keep your current selection if possible, otherwise pick the first one
+        # Keep the current selection if possible, otherwise pick the first one
         if self.selected_corner_id is None and self.captured_corner_ids:
             self.selected_corner_id = self.captured_corner_ids[0]
 
