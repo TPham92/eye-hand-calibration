@@ -3,34 +3,29 @@ import json
 import time
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-
+from pathlib import Path
 import numpy as np
 import cv2
 from PIL import Image, ImageTk
 import pyrealsense2 as rs
 
+CONFIG_PATH = Path(__file__).with_name("config.json")
 
-# ===================== CONFIG =====================
+with open(CONFIG_PATH, "r") as f:   
+    config = json.load(f)
 
 # ChArUco board
-BOARD_SQUARES_X = 7
-BOARD_SQUARES_Y = 5
+BOARD_SQUARES_X = config["charuco_marker"]["columns"]             # number of columns
+BOARD_SQUARES_Y = config["charuco_marker"]["rows"]                # number of rows
+SQUARE_LENGTH_MM = config["charuco_marker"]["square_size"]        # chessboard square size in mm
+MARKER_LENGTH_MM = config["charuco_marker"]["marker_size"]        # inner ArUco marker size in mm
 
-# These should match your PDF generator
-SQUARE_LENGTH_MM = 39.0   # full square size
-MARKER_LENGTH_MM = 31.0   # inner marker
-
-ARUCO_DICT_TYPE = cv2.aruco.DICT_4X4_50
+ARUCO_DICT_TYPE = getattr(cv2.aruco, config["charuco_marker"]["dictionary"])
 
 # RealSense color stream config
-COLOR_WIDTH = 1280
-COLOR_HEIGHT = 720
-COLOR_FPS = 30
-
-# Use only these 6 ChArUco corner IDs as targets
-# Adjust this list if you want different corners
-TARGET_CORNER_IDS = [0, 5, 11, 12, 18, 23]
-
+COLOR_WIDTH = config["rs_camera"]["width"]
+COLOR_HEIGHT = config["rs_camera"]["height"]
+COLOR_FPS = config["rs_camera"]["fps"]
 
 # ===================== MATH HELPERS =====================
 
@@ -108,22 +103,10 @@ def invert_transform(R, t):
 
 def get_board_corners_3d(board):
     """
-    Return Nx3 array of ChArUco board corner positions in board frame (mm),
-    compatible with different ArUco Python bindings.
+    Return Nx3 array of ChArUco board corner positions in board frame (mm)
     """
     pts = None
-
-    if hasattr(board, "getChessboardCorners"):
-        pts = board.getChessboardCorners()
-    elif hasattr(board, "chessboardCorners"):
-        pts = board.chessboardCorners
-    elif hasattr(board, "getObjPoints"):
-        pts = board.getObjPoints()
-    else:
-        raise RuntimeError(
-            "CharucoBoard has no getChessboardCorners/chessboardCorners/getObjPoints"
-        )
-
+    pts = board.getChessboardCorners()
     pts = np.asarray(pts, dtype=np.float64)
 
     # shapes like (N,3) or (N,1,3) or (1,N,3)
@@ -140,7 +123,7 @@ def get_board_corners_3d(board):
 class HandEyeCharucoGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Hand-Eye Calibration (RealSense + ChArUco)")
+        self.root.title("Eye To Hand Calibration (ChArUco)")
 
         # --- ArUco / ChArUco setup ---
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT_TYPE)
@@ -153,6 +136,7 @@ class HandEyeCharucoGUI:
             MARKER_LENGTH_MM,
             self.aruco_dict
         )
+        
         self.board_corners_3d = get_board_corners_3d(self.charuco_board)
 
         # RealSense
@@ -164,7 +148,26 @@ class HandEyeCharucoGUI:
         self.latest_frame = None
         # corner_id -> 3D (mm) in camera_color_optical_frame, kept across frames
         self.current_corner_poses = {}
-        self.zoom_scale = 1.0  # for Zoom + / Zoom -
+
+        # For zoom & pan
+        self.zoom_scale = 1.0  # logical zoom (1.0 = full frame)
+        self.center_x = None   # pan center in pixels (frame coords)
+        self.center_y = None
+        self.pan_step = 40     # pixels per pan click
+
+        # For corner selection
+        self.visible_corner_ids = []        # updated by capture thread
+        self.selected_corner_id = None      # which corner to highlight / capture
+        self.charuco_pixel_positions = {}   # cid -> (px, py) in last frame
+
+        # Board capture state (freeze the board pose so selection doesn't jump)
+        self.board_captured = False
+        self.captured_corner_ids = []
+        self.captured_corner_poses = {}     # cid -> 3D (mm) in camera frame
+        self.captured_pixel_positions = {}  # cid -> (px, py) in captured frame
+
+        # Status text for the UI above the dropdown
+        self.board_status_var = tk.StringVar(value="Board status: Not captured")
 
         # Samples (camera corner vs robot base point)
         self.samples = []
@@ -192,62 +195,105 @@ class HandEyeCharucoGUI:
         main = ttk.Frame(self.root)
         main.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        # Video
+        # ==== LEFT: Video ====
         video_frame = ttk.Frame(main)
         video_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
         self.video_label = ttk.Label(video_frame)
         self.video_label.pack()
 
-        # Zoom controls
-        zoom_frame = ttk.Frame(video_frame)
-        zoom_frame.pack(pady=4)
-        ttk.Button(zoom_frame, text="Zoom -", command=self.on_zoom_out).pack(side=tk.LEFT, padx=2)
-        ttk.Button(zoom_frame, text="Zoom +", command=self.on_zoom_in).pack(side=tk.LEFT, padx=2)
-
-        # Controls
+        # ==== RIGHT: Controls ====
         ctrl = ttk.Frame(main)
         ctrl.grid(row=0, column=1, sticky="nsew")
         main.columnconfigure(0, weight=3)
         main.columnconfigure(1, weight=2)
         main.rowconfigure(0, weight=1)
 
-        # Input frame
-        input_frame = ttk.LabelFrame(ctrl, text="Robot input (base frame, mm)")
-        input_frame.pack(fill=tk.X, pady=(0, 8))
+        # ---------- Top row: Robot input (left) and Camera control (right) ----------
+        top_frame = ttk.Frame(ctrl)
+        top_frame.pack(fill=tk.X, pady=(0, 8))
+        top_frame.columnconfigure(0, weight=1)
+        top_frame.columnconfigure(1, weight=1)
 
-        ttk.Label(input_frame, text="ChArUco Corner ID:").grid(row=0, column=0, sticky="e")
-        self.corner_id_entry = ttk.Entry(input_frame, width=10)
-        self.corner_id_entry.grid(row=0, column=1, sticky="w", padx=4, pady=2)
+        # --- Robot input frame ---
+        input_frame = ttk.LabelFrame(top_frame, text="Robot input (base frame, mm)")
+        input_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
 
-        # Show which corners we care about
-        target_str = ", ".join(f"C{cid}" for cid in TARGET_CORNER_IDS)
-        ttk.Label(input_frame, text=f"Target corners: {target_str}").grid(
-            row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 4)
+        # Board status label
+        ttk.Label(
+            input_frame,
+            textvariable=self.board_status_var
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 2))
+
+        # Button to capture / recapture the board pose
+        ttk.Button(
+            input_frame,
+            text="Capture Board",
+            command=self.on_capture_board
+        ).grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 6))
+
+        # Corner dropdown (starts disabled until board is captured)
+        ttk.Label(input_frame, text="ChArUco Corner:").grid(row=2, column=0, sticky="e")
+
+        self.corner_id_var = tk.StringVar()
+        self.corner_id_combo = ttk.Combobox(
+            input_frame,
+            textvariable=self.corner_id_var,
+            state="disabled",   # <--- disabled until Capture Board
+            width=10
         )
+        self.corner_id_combo.grid(row=2, column=1, sticky="w", padx=4, pady=2)
+        self.corner_id_combo["values"] = []
+        self.corner_id_combo.bind("<<ComboboxSelected>>", self.on_corner_selected)
 
-        ttk.Label(input_frame, text="Robot X (mm):").grid(row=2, column=0, sticky="e")
+        # Robot coordinates
+        ttk.Label(input_frame, text="Robot X (mm):").grid(row=3, column=0, sticky="e")
         self.robot_x_entry = ttk.Entry(input_frame, width=10)
-        self.robot_x_entry.grid(row=2, column=1, sticky="w", padx=4, pady=2)
+        self.robot_x_entry.grid(row=3, column=1, sticky="w", padx=4, pady=2)
 
-        ttk.Label(input_frame, text="Robot Y (mm):").grid(row=3, column=0, sticky="e")
+        ttk.Label(input_frame, text="Robot Y (mm):").grid(row=4, column=0, sticky="e")
         self.robot_y_entry = ttk.Entry(input_frame, width=10)
-        self.robot_y_entry.grid(row=3, column=1, sticky="w", padx=4, pady=2)
+        self.robot_y_entry.grid(row=4, column=1, sticky="w", padx=4, pady=2)
 
-        ttk.Label(input_frame, text="Robot Z (mm):").grid(row=4, column=0, sticky="e")
+        ttk.Label(input_frame, text="Robot Z (mm):").grid(row=5, column=0, sticky="e")
         self.robot_z_entry = ttk.Entry(input_frame, width=10)
-        self.robot_z_entry.grid(row=4, column=1, sticky="w", padx=4, pady=2)
+        self.robot_z_entry.grid(row=5, column=1, sticky="w", padx=4, pady=2)
 
-        ttk.Button(input_frame, text="Capture Sample", command=self.on_capture_sample)\
-            .grid(row=5, column=0, columnspan=2, pady=4)
+        ttk.Button(input_frame, text="Capture Sample", command=self.on_capture_sample) \
+            .grid(row=6, column=0, columnspan=2, pady=4)
 
-        # Samples
+        # --- Camera control frame ---
+        camera_frame = ttk.LabelFrame(top_frame, text="Camera control")
+        camera_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+
+        # Zoom controls
+        zoom_frame = ttk.Frame(camera_frame)
+        zoom_frame.pack(pady=4)
+        ttk.Button(zoom_frame, text="Zoom -", command=self.on_zoom_out).pack(side=tk.LEFT, padx=2)
+        ttk.Button(zoom_frame, text="Zoom +", command=self.on_zoom_in).pack(side=tk.LEFT, padx=2)
+
+        # Pan controls
+        pan_frame = ttk.Frame(camera_frame)
+        pan_frame.pack(pady=4)
+
+        btn_up = ttk.Button(pan_frame, text="Up", command=self.on_pan_up)
+        btn_down = ttk.Button(pan_frame, text="Down", command=self.on_pan_down)
+        btn_left = ttk.Button(pan_frame, text="Left", command=self.on_pan_left)
+        btn_right = ttk.Button(pan_frame, text="Right", command=self.on_pan_right)
+
+        # Arrange in a cross layout
+        btn_up.grid(row=0, column=1, padx=2, pady=2)
+        btn_left.grid(row=1, column=0, padx=2, pady=2)
+        btn_right.grid(row=1, column=2, padx=2, pady=2)
+        btn_down.grid(row=2, column=1, padx=2, pady=2)
+
+        # ---------- Samples list ----------
         samples_frame = ttk.LabelFrame(ctrl, text="Samples")
         samples_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         self.samples_list = tk.Listbox(samples_frame, height=8)
         self.samples_list.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
-        # Bottom controls
+        # ---------- Bottom controls (Calibrate + Save) ----------
         bottom = ttk.Frame(ctrl)
         bottom.pack(fill=tk.X)
 
@@ -257,20 +303,101 @@ class HandEyeCharucoGUI:
         self.save_button = ttk.Button(bottom, text="Save JSON", command=self.on_save_json, state=tk.DISABLED)
         self.save_button.pack(side=tk.LEFT, padx=(0, 4))
 
+        # ---------- Result text ----------
         self.result_text = tk.Text(ctrl, height=12, wrap="word")
         self.result_text.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
 
-        # Initialize the corner ID entry with the first target
-        if TARGET_CORNER_IDS:
-            self.corner_id_entry.insert(0, str(TARGET_CORNER_IDS[0]))
-
-    # ---------- Zoom handlers ----------
+    # ---------- Zoom & Pan handlers ----------
 
     def on_zoom_in(self):
+        # Zoom in (up to 3x)
         self.zoom_scale = min(self.zoom_scale * 1.25, 3.0)
 
     def on_zoom_out(self):
-        self.zoom_scale = max(self.zoom_scale / 1.25, 0.5)
+        # Zoom out, but never below 1.0 (full frame)
+        self.zoom_scale = max(self.zoom_scale / 1.25, 1.0)
+
+    def _ensure_center_initialized(self, frame_rgb):
+        h, w, _ = frame_rgb.shape
+        if self.center_x is None or self.center_y is None:
+            self.center_x = w // 2
+            self.center_y = h // 2
+
+    def _pan(self, dx, dy):
+        if self.latest_frame is None:
+            return
+
+        frame_rgb = cv2.cvtColor(self.latest_frame, cv2.COLOR_BGR2RGB)
+        h, w, _ = frame_rgb.shape
+        self._ensure_center_initialized(frame_rgb)
+
+        self.center_x += dx
+        self.center_y += dy
+
+        # We'll clamp in _update_image when cropping
+
+    def on_pan_left(self):
+        self._pan(-self.pan_step, 0)
+
+    def on_pan_right(self):
+        self._pan(self.pan_step, 0)
+
+    def on_pan_up(self):
+        self._pan(0, -self.pan_step)
+
+    def on_pan_down(self):
+        self._pan(0, self.pan_step)
+
+    # ---------- Corner selection handler ----------
+
+    def on_corner_selected(self, event=None):
+        raw = self.corner_id_var.get().strip()
+        if raw.upper().startswith("C"):
+            raw = raw[1:]
+        try:
+            cid = int(raw)
+            self.selected_corner_id = cid
+        except ValueError:
+            self.selected_corner_id = None
+
+    # ---------- Board capture ----------
+
+    def on_capture_board(self):
+        """
+        Capture (or recapture) the current ChArUco board pose.
+        After this, dropdown + red box use the captured board instead of live detection,
+        so the selection won't jump when the robot arm covers the marker.
+        """
+        if not self.current_corner_poses or not self.charuco_pixel_positions:
+            messagebox.showerror(
+                "Error",
+                "No ChArUco board detected.\nMake sure the whole board is visible and try again."
+            )
+            return
+
+        # Copy current data
+        self.captured_corner_poses = dict(self.current_corner_poses)
+        self.captured_pixel_positions = dict(self.charuco_pixel_positions)
+        self.captured_corner_ids = sorted(self.captured_corner_poses.keys())
+        self.board_captured = True
+
+        # Update status text
+        self.board_status_var.set(
+            f"Board status: Captured ({len(self.captured_corner_ids)} corners)"
+        )
+
+        # Enable and update dropdown values to the captured corners
+        display_values = [f"C{cid}" for cid in self.captured_corner_ids]
+        self.corner_id_combo["values"] = display_values
+        self.corner_id_combo.configure(state="readonly")
+
+        # Keep your current selection if possible, otherwise pick the first one
+        if self.selected_corner_id is None and self.captured_corner_ids:
+            self.selected_corner_id = self.captured_corner_ids[0]
+
+        desired = f"C{self.selected_corner_id}" if self.selected_corner_id is not None else ""
+        if self.corner_id_var.get() != desired:
+            self.corner_id_var.set(desired)
 
     # ---------- RealSense ----------
 
@@ -286,8 +413,6 @@ class HandEyeCharucoGUI:
         print("Pipeline started.")
 
         color_stream = profile.get_stream(rs.stream.color)
-        depth_stream = profile.get_stream(rs.stream.depth)
-
         color_intrinsics = color_stream.as_video_stream_profile().get_intrinsics()
 
         self.camera_matrix = np.array([
@@ -296,19 +421,7 @@ class HandEyeCharucoGUI:
             [0, 0, 1]
         ], dtype=np.float64)
         self.dist_coeffs = np.array(color_intrinsics.coeffs, dtype=np.float64)
-
-        print("Color intrinsics (camera_color_optical_frame):")
-        print(f"  fx: {color_intrinsics.fx}, fy: {color_intrinsics.fy}")
-        print(f"  ppx: {color_intrinsics.ppx}, ppy: {color_intrinsics.ppy}")
-        print(f"  dist: {self.dist_coeffs}")
-
-        depth_intrinsics = depth_stream.as_video_stream_profile().get_intrinsics()
-        print("Depth intrinsics:")
-        print(f"  fx: {depth_intrinsics.fx}, fy: {depth_intrinsics.fy}")
-        print(f"  ppx: {depth_intrinsics.ppx}, ppy: {depth_intrinsics.ppy}")
-        print(f"  dist: {np.array(depth_intrinsics.coeffs, dtype=np.float64)}")
-
-        print("\nNOTE: We are calibrating w.r.t COLOR optical frame.")
+      
 
     def _capture_loop(self):
         while self.running:
@@ -331,78 +444,82 @@ class HandEyeCharucoGUI:
             gray, self.aruco_dict, parameters=self.aruco_params
         )
 
-        # IMPORTANT: do NOT clear current_corner_poses here.
-        # We want to remember previously detected 3D positions
-        # as long as the camera and board do not move.
-        if ids is None or len(ids) == 0:
-            self.latest_frame = frame_bgr
-            return
+        charuco_pixel_positions = {}
+        visible_ids = []
 
-        # Interpolate ChArUco corners
-        result = cv2.aruco.interpolateCornersCharuco(
-            corners, ids, gray, self.charuco_board
-        )
+        if ids is not None and len(ids) > 0:
+            # Interpolate ChArUco corners
+            result = cv2.aruco.interpolateCornersCharuco(
+                corners, ids, gray, self.charuco_board
+            )
 
-        charuco_corners = None
-        charuco_ids = None
+            charuco_corners = None
+            charuco_ids = None
 
-        if isinstance(result, tuple):
-            if len(result) == 3:
-                _, charuco_corners, charuco_ids = result
-            elif len(result) == 2:
-                charuco_corners, charuco_ids = result
+            if isinstance(result, tuple):
+                if len(result) == 3:
+                    _, charuco_corners, charuco_ids = result
+                elif len(result) == 2:
+                    charuco_corners, charuco_ids = result
 
+            if (
+                charuco_corners is not None
+                and charuco_ids is not None
+                and len(charuco_ids) > 0
+            ):
+                # Build correspondences for PnP
+                obj_pts = []
+                img_pts = []
+                for i in range(len(charuco_ids)):
+                    cid = int(charuco_ids[i][0])
+                    px, py = charuco_corners[i][0]
+
+                    img_pts.append([px, py])
+                    obj_pts.append(self.board_corners_3d[cid])
+
+                obj_pts = np.asarray(obj_pts, dtype=np.float64)
+                img_pts = np.asarray(img_pts, dtype=np.float64)
+
+                # Solve PnP
+                success, rvec, tvec = cv2.solvePnP(
+                    obj_pts,
+                    img_pts,
+                    self.camera_matrix,
+                    self.dist_coeffs,
+                    flags=cv2.SOLVEPNP_ITERATIVE
+                )
+                if success:
+                    R_board_cam, _ = cv2.Rodrigues(rvec)
+                    t_board_cam = tvec.reshape(3)
+
+                    # Compute 3D positions for ALL detected corners
+                    for i in range(len(charuco_ids)):
+                        cid = int(charuco_ids[i][0])
+                        px, py = charuco_corners[i][0]
+
+                        charuco_pixel_positions[cid] = (px, py)
+                        visible_ids.append(cid)
+
+                        X_board = self.board_corners_3d[cid]
+                        X_cam = R_board_cam @ X_board + t_board_cam
+                        self.current_corner_poses[cid] = X_cam
+
+        self.visible_corner_ids = sorted(set(visible_ids))
+        self.charuco_pixel_positions = charuco_pixel_positions
+
+        if self.board_captured and self.captured_pixel_positions:
+            pixel_positions = self.captured_pixel_positions
+        else:
+            pixel_positions = {}  # no drawing before capture
+
+        # Draw only the selected corner 
         if (
-            charuco_corners is None
-            or charuco_ids is None
-            or len(charuco_ids) < 1
+            self.board_captured
+            and self.selected_corner_id is not None
+            and pixel_positions
+            and self.selected_corner_id in pixel_positions
         ):
-            self.latest_frame = frame_bgr
-            return
-
-        # Build correspondences for PnP (use all detected corners for robustness)
-        obj_pts = []
-        img_pts = []
-        for i in range(len(charuco_ids)):
-            cid = int(charuco_ids[i][0])
-            px, py = charuco_corners[i][0]
-
-            img_pts.append([px, py])
-            obj_pts.append(self.board_corners_3d[cid])
-
-        obj_pts = np.asarray(obj_pts, dtype=np.float64)
-        img_pts = np.asarray(img_pts, dtype=np.float64)
-
-        # Solve PnP
-        success, rvec, tvec = cv2.solvePnP(
-            obj_pts,
-            img_pts,
-            self.camera_matrix,
-            self.dist_coeffs,
-            flags=cv2.SOLVEPNP_ITERATIVE
-        )
-        if not success:
-            self.latest_frame = frame_bgr
-            return
-
-        R_board_cam, _ = cv2.Rodrigues(rvec)
-        t_board_cam = tvec.reshape(3)
-
-        # Compute 3D positions and draw only the target corners
-        for i in range(len(charuco_ids)):
-            cid = int(charuco_ids[i][0])
-            if cid not in TARGET_CORNER_IDS:
-                continue
-
-            px, py = charuco_corners[i][0]
-
-            # compute 3D point in camera frame
-            X_board = self.board_corners_3d[cid]
-            X_cam = R_board_cam @ X_board + t_board_cam
-            # cache the last known pose for this corner id
-            self.current_corner_poses[cid] = X_cam
-
-            # draw a small RED box on the exact corner
+            px, py = pixel_positions[self.selected_corner_id]
             cv2.rectangle(
                 frame_bgr,
                 (int(px) - 4, int(py) - 4),
@@ -410,14 +527,12 @@ class HandEyeCharucoGUI:
                 (0, 0, 255),
                 thickness=1
             )
-
-            # draw the corner ID above it
             cv2.putText(
                 frame_bgr,
-                f"C{cid}",
+                f"C{self.selected_corner_id}",
                 (int(px) + 5, int(py) - 5),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.3,
+                0.4,
                 (0, 0, 255),
                 1,
                 cv2.LINE_AA
@@ -427,35 +542,98 @@ class HandEyeCharucoGUI:
 
     def _update_image(self):
         if self.latest_frame is not None:
+            # Convert to RGB for Tk
             frame_rgb = cv2.cvtColor(self.latest_frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(frame_rgb)
+            h, w, _ = frame_rgb.shape
 
-            # Apply zoom
-            if self.zoom_scale != 1.0:
-                w, h = img.size
-                img = img.resize(
-                    (int(w * self.zoom_scale), int(h * self.zoom_scale)),
-                    Image.BILINEAR
-                )
+            # Initialize center if needed
+            self._ensure_center_initialized(frame_rgb)
+
+            # Compute region size based on zoom (crop then upscale)
+            zoom = max(self.zoom_scale, 1.0)
+            region_w = int(w / zoom)
+            region_h = int(h / zoom)
+
+            region_w = max(1, min(region_w, w))
+            region_h = max(1, min(region_h, h))
+
+            half_w = region_w // 2
+            half_h = region_h // 2
+
+            cx = int(self.center_x)
+            cy = int(self.center_y)
+
+            cx = max(half_w, min(w - half_w - 1, cx))
+            cy = max(half_h, min(h - half_h - 1, cy))
+            self.center_x, self.center_y = cx, cy
+
+            x1 = cx - half_w
+            x2 = cx + half_w
+            y1 = cy - half_h
+            y2 = cy + half_h
+            x1 = max(0, x1)
+            y1 = max(0, y1)
+            x2 = min(w, x2)
+            y2 = min(h, y2)
+
+            crop = frame_rgb[y1:y2, x1:x2]
+
+            img = Image.fromarray(crop)
+            if (crop.shape[1], crop.shape[0]) != (w, h):
+                img = img.resize((w, h), Image.BILINEAR)
 
             imgtk = ImageTk.PhotoImage(image=img)
             self.video_label.imgtk = imgtk
             self.video_label.configure(image=imgtk)
+
+            # Update corner dropdown
+            if self.board_captured and self.captured_corner_ids:
+                new_ids = list(self.captured_corner_ids)
+            else:
+                new_ids = []
+
+            display_values = [f"C{cid}" for cid in new_ids]
+            current_values = list(self.corner_id_combo["values"])
+
+            # Only touch combo values if they actually changed
+            if display_values != current_values:
+                self.corner_id_combo["values"] = display_values
+
+            if not self.board_captured:
+                # Before capture: clear selection
+                self.selected_corner_id = None
+                if self.corner_id_var.get() != "":
+                    self.corner_id_var.set("")
+            else:
+                # After capture, auto-select the first captured corner if none selected yet
+                if self.selected_corner_id is None and new_ids:
+                    self.selected_corner_id = new_ids[0]
+
+                desired = f"C{self.selected_corner_id}" if self.selected_corner_id is not None else ""
+                if self.corner_id_var.get() != desired:
+                    self.corner_id_var.set(desired)
 
         self.root.after(30, self._update_image)
 
     # ---------- SAMPLE CAPTURE & CALIBRATION ----------
 
     def on_capture_sample(self):
-        if len(self.samples) >= len(TARGET_CORNER_IDS):
-            messagebox.showinfo(
-                "Samples complete",
-                f"You already captured {len(TARGET_CORNER_IDS)} samples."
+        # Require a captured board so samples are based only on frozen data
+        if not self.board_captured:
+            messagebox.showerror(
+                "Error",
+                "Please capture the board first.\n"
+                "Click 'Capture Board' while the full ChArUco board is visible."
             )
             return
 
-        # Corner ID can be "6" or "C6"
-        raw_id = self.corner_id_entry.get().strip()
+        # Corner must come from dropdown selection
+        raw_id = self.corner_id_var.get().strip()
+        if not raw_id:
+            messagebox.showerror("Error", "Please select a ChArUco corner from the dropdown.")
+            return
+
+        # Accept "C6" or "6"
         if raw_id.upper().startswith("C"):
             raw_id = raw_id[1:]
 
@@ -463,14 +641,6 @@ class HandEyeCharucoGUI:
             corner_id = int(raw_id)
         except ValueError:
             messagebox.showerror("Error", "Corner ID must be an integer (e.g. 6 or C6).")
-            return
-
-        if corner_id not in TARGET_CORNER_IDS:
-            messagebox.showerror(
-                "Error",
-                f"Corner C{corner_id} is not in target list.\n"
-                f"Use one of: {', '.join('C'+str(c) for c in TARGET_CORNER_IDS)}"
-            )
             return
 
         try:
@@ -481,15 +651,17 @@ class HandEyeCharucoGUI:
             messagebox.showerror("Error", "Robot X/Y/Z must be numeric (mm).")
             return
 
-        if corner_id not in self.current_corner_poses:
+        # Use captured board pose only
+        if corner_id in self.captured_corner_poses:
+            cam_corner_mm = self.captured_corner_poses[corner_id].copy()
+        else:
             messagebox.showerror(
                 "Error",
-                f"Corner C{corner_id} has never been detected yet.\n"
-                "Make sure it is visible at least once so the camera can estimate its 3D position."
+                f"Corner C{corner_id} is not in the captured board.\n"
+                "Recapture the board if you moved it."
             )
             return
 
-        cam_corner_mm = self.current_corner_poses[corner_id].copy()
         robot_point_mm = np.array([x_mm, y_mm, z_mm], dtype=np.float64)
 
         sample = {
@@ -511,24 +683,9 @@ class HandEyeCharucoGUI:
         self.robot_y_entry.delete(0, tk.END)
         self.robot_z_entry.delete(0, tk.END)
 
-        # Auto-advance to the next target corner that hasn't been used yet
-        used_ids = {s["corner_id"] for s in self.samples}
-        next_id = None
-        for cid in TARGET_CORNER_IDS:
-            if cid not in used_ids:
-                next_id = cid
-                break
-
-        self.corner_id_entry.delete(0, tk.END)
-        if next_id is not None:
-            self.corner_id_entry.insert(0, str(next_id))
-        else:
-            # All done
-            self.corner_id_entry.insert(0, "")
-
     def on_calibrate(self):
         if len(self.samples) < 3:
-            messagebox.showwarning("Not enough samples", "Need at least 3, 6–12 is better.")
+            messagebox.showwarning("Not enough samples", "Need at least 3 samples to calibrate. (6 to 12 samples recommended)")
             return
 
         cam_pts_mm = np.array(

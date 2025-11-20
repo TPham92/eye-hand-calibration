@@ -1,15 +1,7 @@
-# --- Core ---
 numpy==1.26.4
-
-# --- OpenCV with ArUco/ChArUco ---
 opencv-contrib-python==4.8.1.78
-
-# --- RealSense SDK Python bindings ---
 pyrealsense2==2.54.2.5684
-
-# --- GUI / imaging ---
 Pillow==10.2.0
-
-# --- Optional utilities (recommended) ---
-matplotlib==3.8.0
-scipy==1.11.4
+reportlab==4.1.0
+# matplotlib==3.8.0
+# scipy==1.11.4

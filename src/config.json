@@ -1,0 +1,16 @@
+{
+  "charuco_marker":{
+    "dictionary": "DICT_4X4_50",
+    "rows": 5,
+    "columns": 7,
+    "square_size": 39.0,
+    "marker_size": 31.0,
+    "render_dpi": 300,
+    "margin": 2.0
+  },
+  "rs_camera": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30
+  }
+}
