@@ -2,7 +2,7 @@
   "charuco_marker":{
     "dictionary": "DICT_4X4_50",
     "rows": 5,
-    "columns": 7,
+    "columns": 5,
     "square_size": 39.0,
     "marker_size": 31.0,
     "render_dpi": 300,

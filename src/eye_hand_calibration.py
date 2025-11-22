@@ -230,12 +230,21 @@ class HandEyeCharucoGUI:
         )
         self.board_status_label.grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 2))
 
-        # Button to capture / recapture the board pose
+        # Z-offset + Capture board row
+        capture_row = ttk.Frame(charuco_frame)
+        capture_row.grid(row=2, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 6))
+
+        ttk.Label(capture_row, text="Z offset (mm):").pack(side=tk.LEFT)
+
+        self.z_offset_var = tk.StringVar(value="0.00")
+        self.z_offset_entry = ttk.Entry(capture_row, textvariable=self.z_offset_var, width=8)
+        self.z_offset_entry.pack(side=tk.LEFT, padx=(4, 10))
+
         ttk.Button(
-            charuco_frame,
+            capture_row,
             text="Capture board",
             command=self.on_capture_board
-        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=4, pady=(0, 6))
+        ).pack(side=tk.LEFT)
 
         # Robot input (left) and Camera control (right)
         top_frame = ttk.Frame(ctrl)
@@ -677,7 +686,16 @@ class HandEyeCharucoGUI:
             )
             return
 
-        robot_point_mm = np.array([x_mm, y_mm, z_mm], dtype=np.float64)
+        try:
+            z_offset_mm = float(self.z_offset_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Z offset must be numeric (mm).")
+            return
+
+        # Apply constant base-Z correction
+        z_mm_corrected = z_mm - z_offset_mm
+
+        robot_point_mm = np.array([x_mm, y_mm, z_mm_corrected], dtype=np.float64)
 
         sample = {
             "corner_id": corner_id,
@@ -691,7 +709,7 @@ class HandEyeCharucoGUI:
             tk.END,
             f"{idx:02d}: C{corner_id:03d}, "
             f"cam(mm)=({cam_corner_mm[0]:.1f}, {cam_corner_mm[1]:.1f}, {cam_corner_mm[2]:.1f}), "
-            f"robot(mm)=({x_mm:.1f}, {y_mm:.1f}, {z_mm:.1f})"
+            f"robot(mm)=({x_mm:.1f}, {y_mm:.1f}, {z_mm_corrected:.1f})"
         )
 
         self.robot_x_entry.delete(0, tk.END)
