@@ -11,7 +11,7 @@ import pyrealsense2 as rs
 
 CONFIG_PATH = Path(__file__).with_name("config.json")
 
-with open(CONFIG_PATH, "r") as f:   
+with open(CONFIG_PATH, "r") as f:
     config = json.load(f)
 
 # ChArUco board
@@ -105,7 +105,6 @@ def get_board_corners_3d(board):
     """
     Return Nx3 array of ChArUco board corner positions in board frame (mm)
     """
-    pts = None
     pts = board.getChessboardCorners()
     pts = np.asarray(pts, dtype=np.float64)
 
@@ -136,7 +135,7 @@ class HandEyeCharucoGUI:
             MARKER_LENGTH_MM,
             self.aruco_dict
         )
-        
+
         self.board_corners_3d = get_board_corners_3d(self.charuco_board)
 
         # RealSense
@@ -317,15 +316,22 @@ class HandEyeCharucoGUI:
         self.samples_list = tk.Listbox(samples_frame, height=8)
         self.samples_list.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
-        # ---------- Bottom controls (Calibrate + Save) ----------
+        # ---------- Bottom controls (Calibrate + Save/Load) ----------
         bottom = ttk.Frame(ctrl)
         bottom.pack(fill=tk.X)
 
         self.calibrate_button = ttk.Button(bottom, text="Calibrate", command=self.on_calibrate)
         self.calibrate_button.pack(side=tk.LEFT, padx=(0, 4))
 
+        # Save/load full session (samples + board capture) so we can recompute later
+        self.save_session_button = ttk.Button(bottom, text="Save Session", command=self.on_save_session)
+        self.save_session_button.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.load_session_button = ttk.Button(bottom, text="Load Session", command=self.on_load_session)
+        self.load_session_button.pack(side=tk.LEFT, padx=(0, 8))
+
         self.save_button = ttk.Button(bottom, text="Save JSON", command=self.on_save_json, state=tk.DISABLED)
-        self.save_button.pack(side=tk.LEFT, padx=(0, 4))
+        self.save_button.pack(side=tk.LEFT)
 
         # ---------- Result text ----------
         self.result_text = tk.Text(ctrl, height=12, wrap="word")
@@ -427,13 +433,13 @@ class HandEyeCharucoGUI:
 
     def _init_realsense(self):
         self.pipeline = rs.pipeline()
-        config = rs.config()
+        config_rs = rs.config()
 
-        config.enable_stream(rs.stream.color, COLOR_WIDTH, COLOR_HEIGHT, rs.format.bgr8, COLOR_FPS)
-        config.enable_stream(rs.stream.depth, COLOR_WIDTH, COLOR_HEIGHT, rs.format.z16, COLOR_FPS)
+        config_rs.enable_stream(rs.stream.color, COLOR_WIDTH, COLOR_HEIGHT, rs.format.bgr8, COLOR_FPS)
+        config_rs.enable_stream(rs.stream.depth, COLOR_WIDTH, COLOR_HEIGHT, rs.format.z16, COLOR_FPS)
 
         print("Starting RealSense pipeline...")
-        profile = self.pipeline.start(config)
+        profile = self.pipeline.start(config_rs)
         print("Pipeline started.")
 
         color_stream = profile.get_stream(rs.stream.color)
@@ -445,7 +451,6 @@ class HandEyeCharucoGUI:
             [0, 0, 1]
         ], dtype=np.float64)
         self.dist_coeffs = np.array(color_intrinsics.coeffs, dtype=np.float64)
-      
 
     def _capture_loop(self):
         while self.running:
@@ -536,7 +541,7 @@ class HandEyeCharucoGUI:
         else:
             pixel_positions = {}  # no drawing before capture
 
-        # Draw only the selected corner 
+        # Draw only the selected corner
         if (
             self.board_captured
             and self.selected_corner_id is not None
@@ -810,6 +815,162 @@ class HandEyeCharucoGUI:
             json.dump(json_data, f, indent=2)
 
         messagebox.showinfo("Saved", f"Calibration saved to:\n{file_path}")
+
+    # ---------- SESSION SAVE/LOAD ----------
+
+    def on_save_session(self):
+        """
+        Save all input data needed to recompute calibration later.
+        This includes:
+          - captured board state
+          - z-offset
+          - all samples (camera corner mm + robot mm)
+        """
+        if not self.samples:
+            messagebox.showwarning("Nothing to save", "No samples to save yet.")
+            return
+
+        session = {
+            "version": 1,
+            "charuco": {
+                "board_captured": self.board_captured,
+                "captured_corner_ids": list(self.captured_corner_ids),
+                "captured_corner_poses_mm": {
+                    str(cid): self.captured_corner_poses[cid].tolist()
+                    for cid in self.captured_corner_poses
+                },
+                "captured_pixel_positions": {
+                    str(cid): [float(self.captured_pixel_positions[cid][0]),
+                               float(self.captured_pixel_positions[cid][1])]
+                    for cid in self.captured_pixel_positions
+                },
+            },
+            "z_offset_mm": float(self.z_offset_var.get() or 0.0),
+            "samples": [
+                {
+                    "corner_id": int(s["corner_id"]),
+                    "camera_corner_mm": np.asarray(s["camera_corner_mm"]).tolist(),
+                    "robot_point_mm": np.asarray(s["robot_point_mm"]).tolist(),
+                }
+                for s in self.samples
+            ],
+        }
+
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("Session JSON files", "*.json"), ("All files", "*.*")],
+            title="Save calibration session"
+        )
+        if not file_path:
+            return
+
+        with open(file_path, "w") as f:
+            json.dump(session, f, indent=2)
+
+        messagebox.showinfo("Saved", f"Session saved to:\n{file_path}")
+
+    def on_load_session(self):
+        """
+        Load a previously saved session and recompute calibration.
+        Restores:
+          - samples list
+          - captured board state (so dropdown works)
+        Then runs on_calibrate().
+        """
+        file_path = filedialog.askopenfilename(
+            filetypes=[("Session JSON files", "*.json"), ("All files", "*.*")],
+            title="Load calibration session"
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, "r") as f:
+                session = json.load(f)
+        except Exception as e:
+            messagebox.showerror("Load failed", f"Could not read session file:\n{e}")
+            return
+
+        try:
+            # Restore captured board state
+            charuco = session.get("charuco", {})
+            self.board_captured = bool(charuco.get("board_captured", False))
+
+            self.captured_corner_ids = [int(cid) for cid in charuco.get("captured_corner_ids", [])]
+
+            poses = charuco.get("captured_corner_poses_mm", {})
+            self.captured_corner_poses = {
+                int(cid): np.array(poses[str(cid)], dtype=np.float64)
+                for cid in poses
+            }
+
+            pix = charuco.get("captured_pixel_positions", {})
+            self.captured_pixel_positions = {
+                int(cid): (float(pix[str(cid)][0]), float(pix[str(cid)][1]))
+                for cid in pix
+            }
+
+            # Update board status + dropdown if captured
+            if self.board_captured and self.captured_corner_ids:
+                self.board_status_var.set(f"✓ Board captured ({len(self.captured_corner_ids)} corners)")
+                if hasattr(self, "board_status_label"):
+                    self.board_status_label.configure(fg="green")
+
+                display_values = [f"C{cid}" for cid in self.captured_corner_ids]
+                self.corner_id_combo["values"] = display_values
+                self.corner_id_combo.configure(state="readonly")
+
+                if self.selected_corner_id is None and self.captured_corner_ids:
+                    self.selected_corner_id = self.captured_corner_ids[0]
+                self.corner_id_var.set(f"C{self.selected_corner_id}")
+            else:
+                self.board_status_var.set("✗ Board not captured")
+                if hasattr(self, "board_status_label"):
+                    self.board_status_label.configure(fg="red")
+                self.corner_id_combo["values"] = []
+                self.corner_id_combo.configure(state="disabled")
+                self.corner_id_var.set("")
+                self.selected_corner_id = None
+
+            # Restore z-offset
+            z_off = float(session.get("z_offset_mm", 0.0))
+            self.z_offset_var.set(f"{z_off:.2f}")
+
+            # Restore samples
+            self.samples = []
+            self.samples_list.delete(0, tk.END)
+
+            for s in session.get("samples", []):
+                cam_corner_mm = np.array(s["camera_corner_mm"], dtype=np.float64)
+                robot_point_mm = np.array(s["robot_point_mm"], dtype=np.float64)
+                corner_id = int(s["corner_id"])
+
+                self.samples.append({
+                    "corner_id": corner_id,
+                    "camera_corner_mm": cam_corner_mm,
+                    "robot_point_mm": robot_point_mm,
+                })
+
+                idx = len(self.samples)
+                self.samples_list.insert(
+                    tk.END,
+                    f"{idx:02d}: C{corner_id:03d}, "
+                    f"cam(mm)=({cam_corner_mm[0]:.1f}, {cam_corner_mm[1]:.1f}, {cam_corner_mm[2]:.1f}), "
+                    f"robot(mm)=({robot_point_mm[0]:.1f}, {robot_point_mm[1]:.1f}, {robot_point_mm[2]:.1f})"
+                )
+
+        except Exception as e:
+            messagebox.showerror("Load failed", f"Session file is invalid:\n{e}")
+            return
+
+        # Recompute right away if enough samples
+        if len(self.samples) >= 3:
+            self.on_calibrate()
+        else:
+            messagebox.showinfo(
+                "Session loaded",
+                f"Loaded {len(self.samples)} samples.\nAdd at least {3-len(self.samples)} more to calibrate."
+            )
 
     # ---------- CLEANUP ----------
 
